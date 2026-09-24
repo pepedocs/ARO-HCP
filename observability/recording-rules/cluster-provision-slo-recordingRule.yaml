@@ -11,211 +11,80 @@ metadata:
 spec:
   groups:
   # ========================================
-  # Cluster Provisioning SLO Recording Rules
+  # Cluster Provisioning SLO Recording Rules: Windowed Errors (counter-based)
   # ========================================
-  # These rules track the Errors SLO for HCP cluster provisioning (install).
-  # SLO: 95% of cluster create operations should succeed (not reach "failed"
-  # terminal phase). Error Budget: 5% (1 - 0.95).
+  # These windowed records use rate() over the backend_cluster_provision_completions_total
+  # counter, which increments on each cluster create terminal transition. rate()
+  # correctly handles counter resets and measures true event rates over the window.
   #
-  # The SLO denominator counts only succeeded and failed operations. Canceled
-  # operations (superseded or aborted before completion) are excluded from both
-  # the numerator and the denominator, so a user-initiated cancellation neither
-  # counts as a failure nor dilutes the rate; success_rate and error_rate then
-  # sum to 1.
+  # Canceled operations are excluded from both numerator and denominator:
+  # only phase="failed" and phase="succeeded" are counted.
   #
-  # Metrics are gauge-based (backend_resource_operation_phase_info) from Cosmos DB,
-  # so we use count() aggregations rather than rate() on counters.
-  #
-  # NOTE: the instantaneous records below are a trailing ~7-day cumulative
-  # ratio, because the phase gauge is retained for the Cosmos 7-day TTL, so a
-  # single stale failure keeps the ratio elevated for days. Prefer the windowed
-  # records in arohcp_cluster_provision_slo_windowed_recording_rules for
-  # alerting; these instantaneous records are kept for dashboards / compatibility
-  # only.
-  #
-  # Scope: covers create operations on hcpOpenShiftClusters (the cluster install
-  # user journey). Update/delete are covered by the async-operations stuck alert;
-  # node pool operations have their own SLO (nodepool-slo-prometheusRule.yaml).
-  #
-  # Grouping is by the `cluster` label (the management cluster serving the
-  # request), which is a per-region proxy: a regional install failure (e.g. the
-  # ACR canary-replica endpoint outage in AROSLSRE-1592 that failed ~100% of
-  # eastus2 installs) surfaces as a spike in the per-management-cluster error rate.
-  - name: arohcp_cluster_provision_slo_recording_rules
-    interval: 1m
-    rules:
-    # Instantaneous count of succeeded cluster create operations per cluster
-    - record: errors:backend_cluster_provision:succeeded_total
-      expr: |
-        count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-          resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-          operation_type="create",
-          phase="succeeded"
-        }))
-    # Instantaneous count of all terminal cluster create operations per cluster
-    - record: errors:backend_cluster_provision:terminal_total
-      expr: |
-        count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-          resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-          operation_type="create",
-          phase=~"succeeded|failed"
-        }))
-    # Instantaneous error rate per cluster: fraction of terminal operations that failed
-    - record: errors:backend_cluster_provision:error_rate
-      expr: |
-        (
-          count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase="failed"
-          }))
-          or
-          0 * count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase=~"succeeded|failed"
-          }))
-        )
-        /
-        clamp_min(
-          count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase=~"succeeded|failed"
-          })),
-          1
-        )
-  # ========================================
-  # Cluster Provisioning SLO Recording Rules: Windowed Errors (stateless)
-  # ========================================
-  # These windowed records count only cluster create operations whose terminal
-  # transition landed inside the window, via
-  # (time() - backend_resource_operation_last_transition_time_seconds) < W,
-  # so a stale failure ages out of the window instead of smearing for the full
-  # Cosmos 7-day TTL. No new metric and no backend change.
-  #
-  # The `or 0 * ...` term pins the failure count to 0 (not absent) when a
-  # cluster has create operations but none failed in-window.
+  # When both numerator and denominator are zero (no traffic), the division
+  # yields NaN. NaN comparisons return false in PromQL, so alerts will not fire.
   - name: arohcp_cluster_provision_slo_windowed_recording_rules
     interval: 1m
     rules:
-    # --- 1h window (fast burn): terminal transition within 3600s ---
+    # --- 5m window (fast burn short) ---
+    - record: errors:backend_cluster_provision:failed_5m
+      expr: |
+        sum(rate(backend_cluster_provision_completions_total{phase="failed"}[5m]))
+    - record: errors:backend_cluster_provision:total_5m
+      expr: |
+        sum(rate(backend_cluster_provision_completions_total{phase=~"succeeded|failed"}[5m]))
+    - record: errors:backend_cluster_provision:error_rate_5m
+      expr: |
+        errors:backend_cluster_provision:failed_5m
+        /
+        errors:backend_cluster_provision:total_5m
+    # --- 30m window (medium burn short / degradation) ---
+    - record: errors:backend_cluster_provision:failed_30m
+      expr: |
+        sum(rate(backend_cluster_provision_completions_total{phase="failed"}[30m]))
+    - record: errors:backend_cluster_provision:total_30m
+      expr: |
+        sum(rate(backend_cluster_provision_completions_total{phase=~"succeeded|failed"}[30m]))
+    - record: errors:backend_cluster_provision:error_rate_30m
+      expr: |
+        errors:backend_cluster_provision:failed_30m
+        /
+        errors:backend_cluster_provision:total_30m
+    # --- 1h window (fast burn long) ---
     - record: errors:backend_cluster_provision:failed_1h
       expr: |
-        count by (cluster) (
-          (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase="failed"
-          }) == 1)
-          and
-          ((time() - max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_last_transition_time_seconds{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create"
-          })) < 3600)
-        )
-        or
-        0 * count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-          resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-          operation_type="create"
-        }))
+        sum(rate(backend_cluster_provision_completions_total{phase="failed"}[1h]))
     - record: errors:backend_cluster_provision:total_1h
       expr: |
-        count by (cluster) (
-          (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase=~"succeeded|failed"
-          }) == 1)
-          and
-          ((time() - max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_last_transition_time_seconds{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create"
-          })) < 3600)
-        )
+        sum(rate(backend_cluster_provision_completions_total{phase=~"succeeded|failed"}[1h]))
     - record: errors:backend_cluster_provision:error_rate_1h
       expr: |
         errors:backend_cluster_provision:failed_1h
         /
-        clamp_min(errors:backend_cluster_provision:total_1h, 1)
-    # --- 6h window (medium burn): terminal transition within 21600s ---
+        errors:backend_cluster_provision:total_1h
+    # --- 6h window (medium burn long / slow burn short) ---
     - record: errors:backend_cluster_provision:failed_6h
       expr: |
-        count by (cluster) (
-          (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase="failed"
-          }) == 1)
-          and
-          ((time() - max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_last_transition_time_seconds{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create"
-          })) < 21600)
-        )
-        or
-        0 * count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-          resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-          operation_type="create"
-        }))
+        sum(rate(backend_cluster_provision_completions_total{phase="failed"}[6h]))
     - record: errors:backend_cluster_provision:total_6h
       expr: |
-        count by (cluster) (
-          (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase=~"succeeded|failed"
-          }) == 1)
-          and
-          ((time() - max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_last_transition_time_seconds{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create"
-          })) < 21600)
-        )
+        sum(rate(backend_cluster_provision_completions_total{phase=~"succeeded|failed"}[6h]))
     - record: errors:backend_cluster_provision:error_rate_6h
       expr: |
         errors:backend_cluster_provision:failed_6h
         /
-        clamp_min(errors:backend_cluster_provision:total_6h, 1)
-    # --- 3d window (slow burn / budget): terminal transition within 259200s ---
-    - record: errors:backend_cluster_provision:failed_3d
+        errors:backend_cluster_provision:total_6h
+    # --- 72h window (slow burn long, 3d) ---
+    - record: errors:backend_cluster_provision:failed_72h
       expr: |
-        count by (cluster) (
-          (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase="failed"
-          }) == 1)
-          and
-          ((time() - max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_last_transition_time_seconds{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create"
-          })) < 259200)
-        )
-        or
-        0 * count by (cluster) (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-          resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-          operation_type="create"
-        }))
-    - record: errors:backend_cluster_provision:total_3d
+        sum(rate(backend_cluster_provision_completions_total{phase="failed"}[72h]))
+    - record: errors:backend_cluster_provision:total_72h
       expr: |
-        count by (cluster) (
-          (max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_phase_info{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create",
-            phase=~"succeeded|failed"
-          }) == 1)
-          and
-          ((time() - max by (cluster, environment, region, subscription_id, resource_id, resource_type, operation_type, phase) (backend_resource_operation_last_transition_time_seconds{
-            resource_type="microsoft.redhatopenshift/hcpopenshiftclusters",
-            operation_type="create"
-          })) < 259200)
-        )
-    - record: errors:backend_cluster_provision:error_rate_3d
+        sum(rate(backend_cluster_provision_completions_total{phase=~"succeeded|failed"}[72h]))
+    - record: errors:backend_cluster_provision:error_rate_72h
       expr: |
-        errors:backend_cluster_provision:failed_3d
+        errors:backend_cluster_provision:failed_72h
         /
-        clamp_min(errors:backend_cluster_provision:total_3d, 1)
+        errors:backend_cluster_provision:total_72h
   # ========================================
   # Cluster Provisioning SLO Recording Rules — Latency
   # ========================================

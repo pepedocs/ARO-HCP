@@ -60,27 +60,26 @@ spec:
         description: "Cluster create operation for {{ $labels.resource_id }} has been in {{ $labels.phase }} phase for over 30 minutes. Stuck operations are invisible to success/failure SLIs and require investigation."
         runbook_url: "https://aka.ms/arohcp-runbook-cluster-provision"
   # ========================================
-  # Cluster Provisioning SLO Alerts: Windowed Errors (burn-rate, volume-aware)
+  # Cluster Provisioning SLO Alerts: Windowed Errors (burn-rate)
   # ========================================
-  # These read the windowed recording rules
-  # (errors:backend_cluster_provision:{failed,total,error_rate}_{1h,6h,3d}),
-  # which count only cluster create operations whose terminal transition landed
-  # inside the window, so each tier evaluates a real event window instead of the
-  # trailing 7-day gauge ratio. Stateless and level-driven: no new metric and no
-  # backend change.
+  # These read the counter-based windowed recording rules
+  # (errors:backend_cluster_provision:{failed,total,error_rate}_{5m,30m,1h,6h,72h}),
+  # which use rate() over backend_cluster_provision_completions_total to measure
+  # true completion event rates over each window.
   #
-  # Volume guard: each tier requires an absolute floor of completions/failures
-  # in the window so a single failure on a quiet window cannot page.
+  # Paired windows: each burn tier requires both long and short windows to
+  # exceed the threshold, preventing stale long-window data from paging when
+  # the short window has recovered.
   - name: arohcp_cluster_provision_slo_windowed_error_alerts
     labels:
       component: slo
     rules:
-    # Fast Burn (IcM Sev 3, page). 14.4x burn: >72% failures over 1h, >=3 failures.
+    # Fast Burn (IcM Sev 3, page). 14.4x burn: >72% failure rate over 1h AND 5m.
     - alert: userJourneyClusterProvisionErrors1h5m
       expr: |
-        errors:backend_cluster_provision:failed_1h >= 3
-        and
         errors:backend_cluster_provision:error_rate_1h > 0.72
+        and
+        errors:backend_cluster_provision:error_rate_5m > 0.72
       for: 5m
       labels:
         severity: "3"
@@ -88,15 +87,15 @@ spec:
         long_window: 1h
         short_window: 5m
       annotations:
-        summary: "{{ $labels.cluster }}: Cluster create operations failing fast (>72% of recent operations)"
-        description: "More than 72% of completed cluster create (install) operations on {{ $labels.cluster }} failed over the last hour with at least 3 failures, a 14.4x burn of the 95% SLO budget."
+        summary: "Cluster create operations failing fast (>72% failure rate over 1h and 5m)"
+        description: "More than 72% of completed cluster create operations failed over both the last hour and last 5 minutes, a 14.4x burn of the 95% SLO budget."
         runbook_url: "https://aka.ms/arohcp-runbook-cluster-provision"
-    # Medium Burn (IcM Sev 3, page). 6x burn: >30% failures over 6h, >=5 completions.
+    # Medium Burn (IcM Sev 3, page). 6x burn: >30% failure rate over 6h AND 30m.
     - alert: userJourneyClusterProvisionErrors6h30m
       expr: |
-        errors:backend_cluster_provision:total_6h >= 5
-        and
         errors:backend_cluster_provision:error_rate_6h > 0.30
+        and
+        errors:backend_cluster_provision:error_rate_30m > 0.30
       for: 30m
       labels:
         severity: "3"
@@ -104,40 +103,35 @@ spec:
         long_window: 6h
         short_window: 30m
       annotations:
-        summary: "{{ $labels.cluster }}: Cluster create operation error rate elevated (>30% over 6h)"
-        description: "More than 30% of completed cluster create (install) operations on {{ $labels.cluster }} failed over the last 6 hours (at least 5 completions), a 6x burn of the 95% SLO budget."
+        summary: "Cluster create operation error rate elevated (>30% over 6h and 30m)"
+        description: "More than 30% of completed cluster create operations failed over both the last 6 hours and last 30 minutes, a 6x burn of the 95% SLO budget."
         runbook_url: "https://aka.ms/arohcp-runbook-cluster-provision"
-    # Slow Burn / Budget (IcM Sev 4, ticket). 1x burn: >5% failures over 3d, >=10 completions, >=2 failures.
-    - alert: userJourneyClusterProvisionErrors3d
+    # Slow Burn / Budget (IcM Sev 4, ticket). 1x burn: >5% failure rate over 72h AND 6h.
+    - alert: userJourneyClusterProvisionErrors72h6h
       expr: |
-        errors:backend_cluster_provision:total_3d >= 10
+        errors:backend_cluster_provision:error_rate_72h > 0.05
         and
-        errors:backend_cluster_provision:failed_3d >= 2
-        and
-        errors:backend_cluster_provision:error_rate_3d > 0.05
+        errors:backend_cluster_provision:error_rate_6h > 0.05
       for: 6h
       labels:
         severity: "4"
         slo: cluster-provision-errors
-        long_window: 3d
+        long_window: 72h
+        short_window: 6h
       annotations:
-        summary: "{{ $labels.cluster }}: Cluster create operation error budget burning (>5% over 3d)"
-        description: "More than 5% of completed cluster create (install) operations on {{ $labels.cluster }} failed over the last 3 days (at least 10 completions and 2 failures), a 1x burn that exhausts the 95% SLO error budget over the window."
+        summary: "Cluster create operation error budget burning (>5% over 72h and 6h)"
+        description: "More than 5% of completed cluster create operations failed over both the last 72 hours and last 6 hours, a 1x burn that exhausts the 95% SLO error budget over the window."
         runbook_url: "https://aka.ms/arohcp-runbook-cluster-provision"
-    # Early Warning / Degradation (IcM Sev 4, ticket). Precursor: >15% failures over 6h before the burn-rate alerts fire.
+    # Early Warning / Degradation (IcM Sev 4, ticket). Single window: >15% failure rate over 30m.
     - alert: userJourneyClusterProvisionErrorsDegradation
       expr: |
-        errors:backend_cluster_provision:total_6h >= 5
-        and
-        errors:backend_cluster_provision:failed_6h >= 2
-        and
-        errors:backend_cluster_provision:error_rate_6h > 0.15
+        errors:backend_cluster_provision:error_rate_30m > 0.15
       for: 30m
       labels:
         severity: "4"
         slo: cluster-provision-errors
-        long_window: 6h
+        long_window: 30m
       annotations:
-        summary: "{{ $labels.cluster }}: Cluster create operation failure rate exceeds 15% over 6h"
-        description: "More than 15% of completed cluster create (install) operations on {{ $labels.cluster }} failed over the last 6 hours (at least 5 completions and 2 failures), an early warning of degradation before the burn-rate alerts fire."
+        summary: "Cluster create operation failure rate exceeds 15% over 30m"
+        description: "More than 15% of completed cluster create operations failed over the last 30 minutes, an early warning of degradation before the burn-rate alerts fire."
         runbook_url: "https://aka.ms/arohcp-runbook-cluster-provision"

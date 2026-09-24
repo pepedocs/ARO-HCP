@@ -173,6 +173,8 @@ func UpdateOperationStatus(ctx context.Context, clock utilsclock.PassiveClock, r
 		return utils.TrackError(err)
 	}
 
+	recordClusterProvisionCompletion(existingOperation, newOperationStatus)
+
 	notifyOperationOwner(ctx, resourcesDBClient, updatedOperation, postAsyncNotificationFn)
 
 	return nil
@@ -315,6 +317,8 @@ func PatchOperation(ctx context.Context, clock utilsclock.PassiveClock, resource
 	if err != nil {
 		return utils.TrackError(err)
 	}
+
+	recordClusterProvisionCompletion(oldOperation, newOperationStatus)
 
 	notifyOperationOwner(ctx, resourcesDBClient, latestOperation, postAsyncNotificationFn)
 
